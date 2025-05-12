@@ -1,13 +1,17 @@
 //Imports in Rust are Crate_name(Library)::Module(Folders)::Item(Struct)
-use anchor_client::solana_sdk::signature::{read_keypair_file, Signer};
-use anchor_client::{Client, Cluster};
-use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
-use solana_sdk::transaction::Transaction;
+use solana_client::rpc_client::RpcClient;
+use solana_sdk::{
+    instruction::{AccountMeta},
+    pubkey::Pubkey,
+    signature::{read_keypair_file, Signer},
+    transaction::Transaction,
+    commitment_config::CommitmentConfig,
+};
 use std::{rc::Rc, str::FromStr};
 use anyhow::Result;
-use anchor_lang::solana_program::instruction::{Instruction};
 use anchor_lang::{AnchorSerialize, AnchorDeserialize};
 use anchor_lang::solana_program::hash::hash;
+use anchor_lang::solana_program::instruction::Instruction;
 
 
 //Borrowable Constant Which Defines Drifts Program ID
@@ -62,27 +66,24 @@ pub struct PlaceOrderInstruction {
     pub post_only: bool,
 }
 
+
 //Main Function Which Takes no Input and Returns No Output and can Return any Error
-fn main() -> Result<()> {
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     
     //Set Destination To Drift by Changing Drift ID into A Public Key
     let program_id = Pubkey::from_str(DRIFT_DEVNET_ID)?;
     
     //Load KeyPair File
     let keypair = match read_keypair_file("drift-dev-wallet.json") {
-        Ok(kp) => kp,    
+    Ok(kp) => kp,
+    Err(e) => {
+        eprintln!("Failed to read keypair: {}", e);
+        return Err(e.into());
+    }
     };
     
     //Defining Payer(Signer) Using KeyPair. Rc is used so it can be cloned
     let payer = Rc::new(keypair);
-    
-    //Connect To Anchor Client (Cloning payer)
-    let client = Client::new(Cluster::Devnet, payer.clone());
-    println!("Connected to Devnet");
-    
-    //Set Program to Drift
-    let program = client.program(program_id)?;
-    println!("Program loaded: {}", program_id);
 
     //Defining Retrieved User PDA (.0) Means Getting the Pubkey not bump
     let user_pda = derive_user_pda(&program_id, &payer.pubkey());
@@ -119,20 +120,50 @@ fn main() -> Result<()> {
         post_only: true,        
     };
 
-    //Define Discriminator(Unique 8-Byte ID at the beggining of a transaction)
-    let discriminator = hash(b"global:place_order").to_bytes()[..8].to_vec();
     
-    //Declaring a mutable Copy of discriminator
-    let mut data = discriminator;
+    //Hash The Instruction Name Taking The First 8 Bytes 
+    let init_data = hash(b"global:initialize_user").to_bytes()[..8].to_vec();
     
-    //Serializes Order Struct
+    
+    //Create Account Vector Params To Initialise In Drift
+    let init_accounts = vec![
+        AccountMeta::new(user_pda.0, false),
+        AccountMeta::new(user_stats_pda.0, false),
+        AccountMeta::new_readonly(state, false),
+        AccountMeta::new_readonly(payer.pubkey(), true),
+        AccountMeta::new_readonly(solana_program::system_program::ID, false),
+    ];
+
+    //Create Instruction Parameters 
+    let init_instruction = Instruction {
+        program_id,
+        accounts: init_accounts,
+        data: init_data,
+    };
+    
+    //Create Order Parameters
+    let order = PlaceOrderInstruction {
+    order_type: 1,
+    market_index,
+    direction: 0,
+    base_asset_amount: 10_000,
+    price: 10_000_000,
+    reduce_only: false,
+    immediate_or_cancel: false,
+    post_only: true,
+    };
+
+    //Hash Place Order 
+    let mut order_data = hash(b"global:place_order").to_bytes()[..8].to_vec();
+    
+    //Serialise Order Parameters
     let mut order_serialized = order.try_to_vec()?;
     
-    //Append Order Struct To Data
-    data.append(&mut order_serialized);
-    
+    //Append Serialised order to OrderData
+    order_data.append(&mut order_serialized);
+
     //Build Account "Vec![]" (List of Structs) and if the structs need to be signed
-    let accounts = vec![
+    let order_accounts = vec![
         AccountMeta::new(user_pda.0, false),    //User PDA      
         AccountMeta::new(user_stats_pda.0, false), //User Stats PDA
         AccountMeta::new_readonly(state, false),    //Global State PDA
@@ -144,46 +175,37 @@ fn main() -> Result<()> {
     ];
     
     //Create Instruction(Struct) For Solana
-    let instruction = Instruction {
-        program_id,
-        accounts,
-        data,
+    let order_instruction = Instruction {
+    program_id,
+    accounts: order_accounts,
+    data: order_data,
     };
     
     //Helper Comment(About to Send Tx)
     println!("Submitting transaction...");
 
+    //Create an RPC(Rust CLient Struct that Talks to SOl) 
+    //Tells Code to Send Requests To Devnet Address Only considered when Confirmed
+    let rpc = RpcClient::new_with_commitment("https://api.devnet.solana.com".to_string(), CommitmentConfig::confirmed());
+    
+    //Get Latest Blockhash
+    let blockhash = rpc.get_latest_blockhash()?;
 
-    //Create Tx in request function
-    let request = program
-        .request()  //Helper in Anchor Which Says Start building a tx request 
-        .instruction(instruction)   //Build the tx using instruction struct
-        .signer(payer.as_ref()) //Sign the code using Users keypair
-        .options(solana_sdk::commitment_config::CommitmentConfig::confirmed());   //Wait Till Transaction is Confirmed  
-     
-    //Simulate Transaction before Sending
-    let simulation = request.clone().simulate()?;
-    println!("Simulation logs:\n{:#?}", simulation.logs);
+    //Build Transaction using Instruction Struct Public key and blockhash
+    let tx = Transaction::new_signed_with_payer(
+    &[init_instruction, order_instruction],
+    Some(&payer.pubkey()),
+    &[payer.as_ref()],
+    blockhash,
+    );
 
-    //Send Transaction
-    //Match is like an if function if the function returns "ok" do this if the function returns Err do this
-    let sig = match request.send() {
-        Ok(signature) => {
-            println!("Transaction sent! Signature: {}", signature);
-            println!("Waiting for transaction confirmation...");
-            signature
-        },
-        Err(e) => {
-            println!("Transaction failed: {:?}", e);
-            return Err(e.into());
-        }
-    }; 
+    // Simulate Transaction
+    let simulation = rpc.simulate_transaction(&tx)?;
+    println!("Simulation logs:\n{:#?}", simulation.value.logs);
 
-
-    //Print Fee and log
-    println!("Estimated compute units used: {:?}", simulation.units_consumed);
-
-
+    //Send and confirm
+    let sig = rpc.send_and_confirm_transaction(&tx)?;
+    println!("Transaction sent! Signature: {}", sig);
     
     Ok(())
 }
